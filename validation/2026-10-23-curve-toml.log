@@ -1,0 +1,24 @@
+ファン変更には管理者権限が必要です。sudo -Aで実行します。
+変更前: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 1064 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実際のPWM/RPM割合とは異なり、手動制御中も0になる場合があります。
+  hwmon: 1064 / 5500 RPM (19.35% of max RPM)
+  hwmon PWM: 51/255 (20.0%)
+  温度: edge=36°C, junction=36°C, mem=38°C
+  手動カーブ: 未設定（既定値）
+カーブ設定: card1 (0000:0b:00.0), 温度センサー=hotspot/junction
+  25°C:20% 50°C:45% 65°C:65% 85°C:85% 100°C:100%
+変更後: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 1578 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実際のPWM/RPM割合とは異なり、手動制御中も0になる場合があります。
+  hwmon: 1578 / 5500 RPM (28.69% of max RPM)
+  hwmon PWM: 76/255 (29.8%)
+  温度: edge=36°C, junction=36°C, mem=38°C
+  公開カーブ（hotspot °C:PWM%）: 25:20 50:45 65:65 85:85 100:100
+自動制御へ復帰後: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 1538 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実際のPWM/RPM割合とは異なり、手動制御中も0になる場合があります。
+  hwmon: 1538 / 5500 RPM (27.96% of max RPM)
+  hwmon PWM: 73/255 (28.63%)
+  温度: edge=35°C, junction=35°C, mem=38°C
+  手動カーブ: 未設定（既定値）

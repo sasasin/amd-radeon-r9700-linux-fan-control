@@ -1,0 +1,380 @@
+# AMD Radeon R9700 Linux fan control
+
+Ubuntu 26.04とAMD公式ドライバ・ROCmを前提とする、依存Pythonパッケージ不要のCLIです。
+AMD SMIのC APIをPython標準の`ctypes`で呼び出してRPMを測定し、amdgpuのsysfsでファンを操作します。
+
+**このPCのR9700で、40%への変更と自動制御への復帰を実機確認済みです。**
+PWM 20%・約1,066 RPMからPWM 40%・約2,052 RPMへ変わり、
+自動制御へ復帰後はPWM 20%・約1,064 RPMへ戻りました。
+
+このPCでは`/etc/modprobe.d/90-amdgpu-fan-control.conf`の配置と、
+kernel 7.0.0-38-genericのinitramfs更新、再起動まで完了しています。
+動作中のマスクは`0xfff7ffff`で、`gpu_od/fan_ctrl/fan_curve`が公開されています。
+
+## 使い方
+
+このディレクトリで実行します。Python 3.11以上と`uv`、AMD SMIの`libamd_smi.so`が必要です。
+
+```bash
+# 現在のRPM、温度、制御インターフェース
+uv run fan_control.py status
+uv run fan_control.py status --json
+
+# 40%にして測定し、10秒後に標準の自動制御へ復帰
+uv run fan_control.py test 40 --seconds 10
+
+# 40%に固定。5秒待って変更後のRPMを測定し、設定を維持して終了
+uv run fan_control.py set 40
+
+# 標準の自動制御へ復帰
+uv run fan_control.py auto
+
+# 複数GPUの場合はDRM card名かPCI BDFを指定
+uv run fan_control.py set 40 --gpu 0000:0b:00.0 --settle 8
+```
+
+## 温度カーブの設定
+
+`curve`で「温度°C:PWM%」を指定できます。このR9700は**正確に5点**、
+温度25〜100°C、PWM 20〜100%を受け付けます。点数・許容範囲は毎回ドライバから読みます。
+温度は**hotspot / junction**で、`status`の`junction`を確認してください。
+edge温度やメモリ温度を選ぶ機能はありません。
+
+```bash
+# 検証と内容表示だけ（sudo・書き込みなし）
+uv run fan_control.py curve 25:20 50:45 65:65 85:85 100:100 --dry-run
+
+# 適用して終了。以後はGPUファームウェアが温度に応じて制御
+uv run fan_control.py curve 25:20 50:45 65:65 85:85 100:100
+
+# TOMLから適用（上の指定と同じ設定）
+uv run fan_control.py curve --config config/fan-curve.example.toml
+
+# 一時的に設定して観測し、測定後10秒で標準自動制御へ戻す
+uv run fan_control.py curve --config config/fan-curve.example.toml --settle 8 --seconds 10
+
+# 現在のカーブ、PWM、RPM、温度
+uv run fan_control.py status
+
+# メーカー既定の自動制御へ戻す
+uv run fan_control.py auto
+```
+
+TOMLの形式は次のとおりです。追加Pythonパッケージは不要です。
+
+```toml
+points = [
+    [25, 20],
+    [50, 45],
+    [65, 65],
+    [85, 85],
+    [100, 100],
+]
+```
+
+温度は重複なしの昇順、PWMは同じ値または増加する整数で指定します。
+入力を勝手に並べ替えたり、点数を補間して増減したり、許容範囲へ丸めたりはしません。
+点間の温度追従はGPUファームウェアの直線カーブ制御に任せます。
+瞬時の温度表示とPWMが、温度の応答時間や量子化も含めて算術的に完全一致する保証ではありません。
+低温側・高温側も指定で覆うよう、例では許容範囲の両端25°C・100°Cを含めています。
+
+全点を検証してから書き込み、コミット後に全点を読み戻して照合します。
+設定途中の失敗や測定中の中断時には標準自動制御への復帰を試みます。
+`--seconds`なしの正常終了ではカーブが残り、プロセス終了後もGPU側が制御を続けます。
+`--seconds`ありでは観測後に既定値へ戻します。以前の独自カーブへの復元ではありません。
+再起動後にカーブを再適用する仕組みは含みません。
+カーブ設定は`fan_curve`対応GPU専用で、従来の`pwm1`のみのGPUには対応しません。
+
+変更時だけ内部で`sudo -A /usr/bin/python3 ...`を実行します。uv自体をrootで動かす必要はありません。
+認証は設定済みのaskpassヘルパーが行い、スクリプトはパスワードを扱いません。
+NoNewPrivsでsudoが禁止されているサンドボックスでは、通常のホスト端末で実行してください。
+制御非対応・範囲外の場合はsudoや書き込みを行う前にエラーで終了します。
+
+`--settle`は変更後の測定までの待機時間です。`test`はその後さらに`--seconds`秒維持します。
+`test`の正常終了、Ctrl+C、SIGTERMでは自動制御へ戻します。
+`set`の正常終了後は手動設定が残るので、終了したいときは`auto`を実行します。
+設定途中の失敗時も自動制御への復帰を試み、復帰失敗はエラーとして表示します。
+SIGKILL・電源断での後処理はできません。常駐デーモンや再起動後の設定再適用は含みません。
+
+## 「%」の意味
+
+`set 40`は**ファンのPWM制御値40%**を意味します。
+実測RPMが`fan1_max`の厳密な40%になるという保証はありません。
+現機でもSMI制御値20%に対して、実測1,066 / 最大5,500 RPM ≒ 19.38%でした。
+出力ではhwmonのPWM割合と、実測RPM / 最大RPMの割合を別々に表示します。
+AMD SMIは実測RPMの取得に使います。このPCのOverDrive有効時は、AMD SMIの設定割合が
+手動40%に変更しても0%のままでした。SMIの`level_percent`を実際のPWM割合として扱わず、
+`hwmon_pwm.percent`を確認してください。`rocm-smi --showfan`でもPWM 40%を照合しています。
+指定した最大RPM割合に厳密に合わせ続けるフィードバック制御は、この版には含みません。
+
+## R9700の制御を有効化
+
+設定案は[config/90-amdgpu-fan-control.conf](config/90-amdgpu-fan-control.conf)です。
+このPCでは既に適用済みです。以下は他の環境や再セットアップ時の手順です。
+元のマスクに`PP_OVERDRIVE_MASK`（bit 14、`0x4000`）だけを加えます。
+
+```text
+変更前: 0xfff7bfff
+変更後: 0xfff7ffff
+差分: 0x00004000
+```
+
+この設定は操作インターフェースを有効にします。それ自体ではクロック・電圧・ファン速度を変更しません。
+他のPCやドライバ更新後はこのマスクをそのまま使わず、下記の手順で対象ドライバの既定値とビット定義を確認して計算してください。
+既存の`options amdgpu`やカーネル引数に`ppfeaturemask`がある場合は競合を解消してください。
+
+```bash
+sudo -A install -m 0644 config/90-amdgpu-fan-control.conf /etc/modprobe.d/90-amdgpu-fan-control.conf
+sudo -A update-initramfs -u -k all
+```
+
+作業を保存してPCを再起動した後に確認します。
+実行中のGPUを使うプロセスに影響するため、モジュールの強制アンロードやPCI unbindは行いません。
+
+```bash
+cat /sys/module/amdgpu/parameters/ppfeaturemask
+uv run fan_control.py status
+uv run fan_control.py test 40 --seconds 10
+amd-smi metric --gpu 0000:0b:00.0 --fan --temperature --json
+```
+
+`status`の`backend=fan_curve`が目安です。許容範囲はVBIOSから動的に読みます。
+再起動後もインターフェースがない場合、マスクだけで解決できたとは判断できません。
+`status --json`の診断とドライバのログを調査する必要があります。
+
+設定を元に戻す場合は、まず`auto`を実行した上で、このファイルだけを削除しinitramfsを更新して再起動します。
+
+```bash
+uv run fan_control.py auto
+sudo -A rm /etc/modprobe.d/90-amdgpu-fan-control.conf
+sudo -A update-initramfs -u -k all
+```
+
+### マスク値を見直すタイミング
+
+`/etc/modprobe.d/90-amdgpu-fan-control.conf`の値は、amdgpuカーネルドライバの
+電力管理機能のマスクです。アップデートのたびに数値を変更する必要はありません。
+**使用するドライバの既定マスク・ビット定義・機能の公開条件を確認し、変更がある場合に見直します。**
+
+| 契機 | 確認すること |
+| --- | --- |
+| amdgpuドライバ更新 | 新版の既定マスク、OverDriveのビット定義、ファン制御の公開条件 |
+| ROCm更新 | ユーザー空間の更新だけなら通常は変更不要。amdgpuも同時更新される場合はドライバ更新として確認 |
+| Linuxカーネル更新 | 同じDKMSドライバの再ビルドか、異なるドライバ版・標準内蔵ドライバへの切り替えか |
+| GPUファームウェア・VBIOS更新、GPU交換 | ファン制御インターフェースの有無、点数・温度・PWMの許容範囲。必ずマスク変更になるわけではない |
+| OS更新、ドライバ導入方法・起動設定の変更 | 使用ドライバ、設定ファイルの保持、他の設定との競合、initramfsへの収録 |
+
+この設定はマスク全体を数値で上書きします。
+「その時点の既定値にOverDriveだけを追加する」という指定をmodprobeが毎回計算するわけではありません。
+そのため、カーブが引き続き動いていても、古い固定値が新しいドライバの既定方針とずれていないかを確認します。
+
+### 参照元と対象ドライバの特定
+
+参照する一次情報は次の3か所です。GitHubの最新版だけでなく、**実際に使用するドライバ版のソース**を基準にします。
+
+| 情報 | ソース内の場所・識別子 | このPCで確認した値・動作 |
+| --- | --- | --- |
+| ビットの意味 | `amd/include/amd_shared.h`の`enum PP_FEATURE_MASK`、`PP_OVERDRIVE_MASK` | `0x4000`（bit 14） |
+| 設定未指定時の既定マスク | `amd/amdgpu/amdgpu_drv.c`の`amdgpu_pp_feature_mask`初期値 | `0xfff7bfff` |
+| OverDriveの有効化判定 | `amd/pm/swsmu/amdgpu_smu.c`の`smu_set_funcs`、`od_enabled` | `PP_OVERDRIVE_MASK`が立っているかを判定 |
+
+上表の相対パスは、このPCのAMD DKMSソースを基準にしています。
+Linux本体のソースでは`amd/`部分が`drivers/gpu/drm/amd/`です。
+[カーネルのパラメータ説明](https://docs.kernel.org/gpu/amdgpu/module-parameters.html)も
+`enum PP_FEATURE_MASK`を定義元として案内しています。
+公開ソースの参照先は[ビット定義](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/include/amd_shared.h)、
+[既定値](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c)、
+[有効化判定](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c)です。
+これらの`master`リンクは構造を調べるための参照先で、導入済み版と一致する保証はありません。
+
+まず、動作中とディスク上のドライバを区別して確認します。
+
+```bash
+uname -r
+cat /sys/module/amdgpu/version
+modinfo -n amdgpu
+modinfo -F version amdgpu
+dkms status
+```
+
+このPCでは`modinfo -n amdgpu`が
+`/lib/modules/7.0.0-38-generic/updates/dkms/amdgpu.ko.zst`を返し、
+AMDのDKMS版が選ばれていました。`modinfo`はディスク上のモジュール情報なので、
+更新直後・再起動前には動作中の版と異なる場合があります。
+次回起動するカーネルが別なら、`modinfo -k <対象カーネル版> -n amdgpu`と
+`modinfo -k <対象カーネル版> -F version amdgpu`でその版を確認します。
+バージョン情報が出ない場合も、モジュールのパスと導入パッケージに対応するソースを確認してください。
+
+次のソースパスは初回検証時の例です。更新後は対象モジュールに対応するパッケージのソースへ置き換えます。
+`/usr/src`に旧版が残っていても、その旧版の定義を新版の計算に使わないでください。
+対応するソースが手元にない場合は、導入元が提供する該当版のソースを参照します。
+
+```bash
+amdgpu_source=/usr/src/amdgpu-7.1.3-2390945.26.04
+rg -n 'amdgpu_pp_feature_mask[[:space:]]*=' "$amdgpu_source/amd/amdgpu/amdgpu_drv.c"
+rg -n 'PP_OVERDRIVE_MASK[[:space:]]*=' "$amdgpu_source/amd/include/amd_shared.h"
+rg -n -A 4 -B 4 'smu->od_enabled = true' "$amdgpu_source/amd/pm/swsmu/amdgpu_smu.c"
+```
+
+`cat /sys/module/amdgpu/parameters/ppfeaturemask`で読めるのは、設定を上書きした後の動作中の値です。
+そこから**新しいドライバ本来の既定値は取得できません**。既定値の確認には上記ソースを使います。
+
+### マスクの導出
+
+基本式は`対象ドライバの既定マスク | 対象ドライバのPP_OVERDRIVE_MASK`です。
+既に他のビットを意図的に変更している場合は、その目的も確認して基準マスクに反映します。
+古い設定値を無条件に基準にすると、新しい既定値との差分を見落とします。
+
+初回検証では次の定義を確認しました。
+
+```c
+/* amd/amdgpu/amdgpu_drv.c */
+uint amdgpu_pp_feature_mask = 0xfff7bfff;
+
+/* amd/include/amd_shared.h */
+PP_OVERDRIVE_MASK = 0x4000,
+```
+
+確認した値を使ってPythonで計算できます。以下は計算と表示だけで、設定は変更しません。
+ドライバ更新後は、2つの入力値をその版の定義に合わせて置き換えてください。
+
+```bash
+python3 - <<'PY'
+default_mask = int("0xfff7bfff", 16)
+overdrive_mask = int("0x4000", 16)
+new_mask = default_mask | overdrive_mask
+print(f"既定値: {default_mask:#010x}")
+print(f"追加ビット: {overdrive_mask:#010x}")
+print(f"設定値: {new_mask:#010x}")
+print(f"変更されたビット: {default_mask ^ new_mask:#010x}")
+PY
+```
+
+この例の設定値は`0xfff7ffff`、変更されたビットは`0x00004000`です。
+もともと無効なGFX DCS（bit 19）は無効のままです。
+既定値で既にOverDriveが有効なら、この目的のための上書き設定は不要か検討できます。
+「全ビットを1にする」値へ置き換える方法は使いません。
+
+### 設定の反映と確認
+
+数値を変更する前に、既存のmodprobe設定と起動引数を確認します。
+`modprobe -c`は現在の設定ファイルから組み立てた内容で、既に動作中のGPUへの反映確認ではありません。
+
+```bash
+modprobe -c | rg '^options amdgpu'
+rg -n 'ppfeaturemask' /etc/modprobe.d /usr/lib/modprobe.d /etc/default/grub /etc/default/grub.d /proc/cmdline 2>/dev/null
+```
+
+別ファイルや起動引数に重複指定があれば解消します。
+導出した数値を`config/90-amdgpu-fan-control.conf`に記載し、コメントにも対象ドライバ版・
+既定値・追加したビットの根拠を残してから配置します。
+
+```bash
+sudo -A install -m 0644 config/90-amdgpu-fan-control.conf /etc/modprobe.d/90-amdgpu-fan-control.conf
+sudo -A update-initramfs -u -k all
+```
+
+このPCの`mkinitramfs`は`/etc/modprobe.d/*.conf`をinitramfsへコピーします。
+そのため、**マスク値の見直し**と**変更した設定のinitramfsへの反映**は別の作業です。
+カーネル更新時のinitramfs生成では通常、既存の設定ファイルも取り込まれます。
+設定ファイルを変更した場合は、起動に使うinitramfsを更新します。
+`-u -k all`は既存のinitramfsがある全カーネル版を対象にします。
+特定版だけを更新する場合は`-k <対象カーネル版>`を使います。
+[update-initramfsの仕様](https://manpages.debian.org/trixie/initramfs-tools/update-initramfs.8.en.html)も参照してください。
+
+更新が成功したことと、次回起動に使うイメージへの収録を確認します。
+次はkernel 7.0.0-38-genericの例なので、確認対象の版に合わせてパスを置き換えます。
+
+```bash
+cat /etc/modprobe.d/90-amdgpu-fan-control.conf
+modprobe -c | rg '^options amdgpu'
+lsinitramfs /boot/initrd.img-7.0.0-38-generic | rg 'etc/modprobe.d/90-amdgpu-fan-control.conf'
+```
+
+再起動後に、動作中の版・実効マスク・制御インターフェースを確認します。
+
+```bash
+uname -r
+cat /sys/module/amdgpu/version
+cat /sys/module/amdgpu/parameters/ppfeaturemask
+uv run fan_control.py status --json
+uv run fan_control.py curve --config config/fan-curve.example.toml --dry-run
+```
+
+実効マスクが意図した値であること、`backend`が`fan_curve`であること、
+新しい温度・PWM許容範囲や点数でも設定例が妥当かを確認します。
+値が反映されてもインターフェースが出ない場合は、ドライバ・GPUファームウェア・VBIOSの
+公開条件を調べます。マスクをさらに広げれば解決するとは限りません。
+カーブそのものは再起動で解除されるため、起動設定の反映確認後に必要に応じて再適用します。
+
+## 制御方式
+
+* R9700などの`gpu_od/fan_ctrl/fan_curve`がある場合: 全ての公開設定点のPWMを同じ割合にしてコミットします。有効な温度設定がある場合は維持し、初期値が全点ゼロの場合は公開された許容温度範囲に設定点を配置します。このPCでは25、44、63、81、100°Cです。Zero RPM設定が対応している場合は停止機能を無効化します。空欄の非対応項目には書き込みません。設定を読み戻して一致を確認します。
+* 従来の書き込み可能な`pwm1`と`pwm1_enable`がある場合: 手動モードにして、`pwm1_max`に対する割合を丸めて設定します。
+* `auto`: ファンカーブと変更したZero RPM項目をVBIOS既定値に戻すか、従来の自動モードに戻します。以前の独自ファン設定を保存・復元する機能ではありません。
+
+新しいAMD SMIの`set --fan`は`gpu_od`環境で`fan_minimum_pwm`を使う場合があります。
+これは自動制御中の下限で、一定割合の固定設定と同じではありません。そのため、このCLIでは固定カーブを使います。
+ファームウェアの保護動作によって実際のファン動作が変わる場合があります。
+`set`による固定割合では温度に追従しないため、負荷に対して十分な割合を選び、測定値を確認してください。
+複数の制御ソフトを同時に操作すると設定が競合します。
+
+## 検証
+
+```bash
+uv run --offline python -m unittest discover -s tests -v
+```
+
+入力範囲、書き込み非対応、複数GPUの曖昧さ、設定の読み戻し、途中失敗時の復帰などを検証します。
+28件が成功しています。カーブ入力の点数・範囲・並び順・TOML、書き込み前の拒否、
+dry-run時の非昇格、一時設定の自動復帰、初期カーブが全点ゼロの場合、空欄のZero RPM項目、
+SMI初期化が失敗した場合の自動制御復帰も確認しています。
+ファイルを使うテストと実機のファン変更は別で、テスト合格だけでは実機での制御成功を意味しません。
+再起動前後の実測は[validation/2026-10-23.md](validation/2026-10-23.md)に記録しています。
+温度カーブのTOML/CLI設定、実測PWM/RPM、コマンド終了後の保持確認は
+[validation/2026-10-23-curve.md](validation/2026-10-23-curve.md)に記録しています。
+
+## 他のAMD Radeon製品での利用
+
+**実機で動作確認済みなのは、このPCのRadeon AI PRO R9700です。**
+同じamdgpuインターフェースを公開する他製品でも利用できる可能性はありますが、
+Radeon製品であることや、`ppfeaturemask`を調整したことだけで動作を保証するものではありません。
+対応可否は、ドライバ・GPUファームウェア・VBIOSが公開する制御機能によって決まります。
+
+| 公開されている制御インターフェース | 現在の実装で利用できる範囲 |
+| --- | --- |
+| 今回と同じ形式の`gpu_od/fan_ctrl/fan_curve` | 固定PWM・温度カーブともに対応候補。別製品での実機検証は未実施 |
+| 書き込み可能な`pwm1`と`pwm1_enable` | 固定PWM・自動復帰の経路を実装済み。模擬テストのみで、`curve`は非対応 |
+| ファン制御がamdgpuに公開されない構成 | 非対応。別コントローラで冷却ファンを管理する構成などは別途対応が必要 |
+| 古い`radeon`ドライバを使う構成 | 非対応。デバイス検出は`amdgpu`を前提としている |
+
+カーブの点数・温度範囲・PWM範囲はドライバから取得するため、
+R9700の「5点・25〜100°C・20〜100%」を他製品へ固定して適用する実装ではありません。
+ただし、現状はカーブのパスとテキスト形式を今回確認したものに合わせており、
+形式が異なるGPUには追加対応が必要です。
+また、測定時に`fan1_input`・`fan1_max`などを必須としているため、
+制御インターフェースがあっても、これらの項目が存在しない・読み取れないGPUではエラーになる場合があります。
+
+他製品で確認する場合は、次の順序で進めます。
+
+1. 対象ドライバの定義を調べ、必要なら前述の手順でマスクを導出・反映する。
+2. `uv run fan_control.py status --json`で、対象GPU・`backend`・センサー値・カーブの形式と許容範囲を確認する。
+3. `fan_curve`対応なら、そのGPUの点数・許容範囲に合った設定を`curve ... --dry-run`で検証する。付属TOMLはR9700用の例なので、そのまま流用できるとは限らない。
+4. 固定PWMは`test`、カーブは`curve ... --seconds 10`で一時適用し、設定の読み戻し、PWM/RPMの変化、標準自動制御への復帰を実測する。複数GPUでは`--gpu`で対象を明示する。
+
+`status`でファイルが見えることや`dry-run`が成功することだけでは、
+GPUが実際に設定を受け付け、意図したファン動作になる保証にはなりません。
+互換性の判断は製品シリーズ名だけで行わず、制御・測定・復帰まで確認してください。
+
+## 参照
+
+* [AMD SMI Python API / ファン速度取得・設定](https://rocm.docs.amd.com/projects/amdsmi/en/latest/reference/amdsmi-py-api.html)
+* [Linux amdgpu: HWMON・fan_curve・fan_minimum_pwm](https://docs.kernel.org/gpu/amdgpu/thermal.html)
+* [AMD SMI公式実装](https://github.com/ROCm/amdsmi)
+* [amdgpu SMU 14.0.2の実装](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c)
+
+このPCのインストール済みソースも照合しました。
+`/usr/src/amdgpu-7.1.3-2390945.26.04/amd/include/amd_shared.h`の`PP_OVERDRIVE_MASK = 0x4000`、
+`amd/pm/swsmu/amdgpu_smu.c`の`od_enabled`、
+`amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c`のカーブ編集・復帰処理、
+`/opt/rocm/core-10.0/include/amd_smi/amdsmi.h`のC APIとBDFレイアウトを使っています。

@@ -1,0 +1,29 @@
+[
+  {
+    "card": "card1",
+    "bdf": "0000:0b:00.0",
+    "backend": "fan_curve",
+    "hwmon": "/sys/class/drm/card1/device/hwmon/hwmon1",
+    "temperatures_c": {
+      "edge": 38.0,
+      "junction": 38.0,
+      "mem": 40.0
+    },
+    "rpm_max": 5500,
+    "hwmon_rpm": 1066,
+    "rpm_percent": 19.38,
+    "hwmon_pwm": {
+      "level": 51,
+      "level_max": 255,
+      "percent": 20.0
+    },
+    "amd_smi": {
+      "rpm": 1066,
+      "level": 0,
+      "level_max": 100,
+      "level_percent": 0.0
+    },
+    "fan_curve": "OD_FAN_CURVE:\n0: 0C 0%\n1: 0C 0%\n2: 0C 0%\n3: 0C 0%\n4: 0C 0%\nOD_RANGE:\nFAN_CURVE(hotspot temp): 25C 100C\nFAN_CURVE(fan speed): 20% 100%\n",
+    "zero_rpm_supported": false
+  }
+]

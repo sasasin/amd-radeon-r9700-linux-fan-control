@@ -1,0 +1,9 @@
+# Hotspot / junction temperature (°C), PWM (%).
+# This R9700 exposes exactly five points, 25..100°C and 20..100% PWM.
+points = [
+    [25, 20],
+    [50, 45],
+    [65, 65],
+    [85, 85],
+    [100, 100],
+]

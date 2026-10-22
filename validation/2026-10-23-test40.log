@@ -1,0 +1,17 @@
+ファン変更には管理者権限が必要です。sudo -Aで実行します。
+変更前: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 1066 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実測PWM/RPMの割合ではありません。自動制御中は0になる場合があります。
+  hwmon: 1066 / 5500 RPM (19.38% of max RPM)
+  温度: edge=39°C, junction=40°C, mem=42°C
+要求PWM割合: 40%（実測RPMは以下で確認）
+変更後: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 2052 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実測PWM/RPMの割合ではありません。自動制御中は0になる場合があります。
+  hwmon: 2052 / 5500 RPM (37.31% of max RPM)
+  温度: edge=39°C, junction=39°C, mem=42°C
+自動制御へ復帰後: card1 (0000:0b:00.0), backend=fan_curve
+  AMD SMI: 2014 RPM, ドライバ設定値 0/100 (0.0%)
+  ※SMIの割合は実測PWM/RPMの割合ではありません。自動制御中は0になる場合があります。
+  hwmon: 2014 / 5500 RPM (36.62% of max RPM)
+  温度: edge=38°C, junction=38°C, mem=40°C
