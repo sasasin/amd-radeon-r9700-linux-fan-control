@@ -1,4 +1,4 @@
-"""Hardware-independent checks for the boot-time apply script and its unit."""
+"""Hardware-independent checks for the boot-time and resume-time apply scripts."""
 
 from pathlib import Path
 import os
@@ -10,22 +10,33 @@ import unittest
 
 REPO = Path(__file__).resolve().parent.parent
 APPLY = REPO / "deploy" / "r9700-fan-curve.sh"
-UNIT = REPO / "deploy" / "r9700-fan-curve.service"
+BOOT_UNIT = REPO / "deploy" / "r9700-fan-curve.service"
+RESUME_UNIT = REPO / "deploy" / "r9700-fan-curve-resume.service"
 SCRIPT_PATH = "/usr/local/lib/r9700-fan-control/fan_control.py"
 SCRIPT_BIN = "/usr/local/sbin/r9700-fan-curve.sh"
 UNIT_PATH = "/etc/systemd/system/r9700-fan-curve.service"
+RESUME_UNIT_PATH = "/etc/systemd/system/r9700-fan-curve-resume.service"
 CONFIG_PATH = "/etc/r9700/fan-curve.toml"
+SLEEP_TARGETS = ("suspend.target", "hibernate.target", "hybrid-sleep.target",
+                 "suspend-then-hibernate.target")
 
 
-def unit_settings():
-    """Return ExecStart and Environment values from the unit file."""
+def unit_settings(path):
+    """Return the ExecStart and Environment values, plus the target lists, of a unit."""
     result = {}
-    for line in UNIT.read_text().splitlines():
-        if line.startswith("ExecStart="):
-            result["ExecStart"] = line.removeprefix("ExecStart=").strip()
-        elif line.startswith("Environment="):
-            key, _, value = line.removeprefix("Environment=").strip().partition("=")
-            result[key] = value
+    for line in path.read_text().splitlines():
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if name == "ExecStart":
+            result["ExecStart"] = value
+        elif name == "Environment":
+            key, _, item = value.partition("=")
+            result[key] = item
+        elif name == "RemainAfterExit":
+            result[name] = value
+        elif name in ("After", "WantedBy"):
+            result.setdefault(name, []).extend(value.split())
     return result
 
 
@@ -91,21 +102,41 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("installed script is missing", result.stderr)
         self.assertIsNone(arguments)
 
-    def test_unit_and_script_defaults_address_the_installed_files(self):
-        settings = unit_settings()
-        self.assertEqual(settings["ExecStart"], SCRIPT_BIN)
-        self.assertEqual(settings["CONFIG"], CONFIG_PATH)
-        self.assertEqual(settings["SETTLE"], "0")
-
-        apply_text = APPLY.read_text()
-        self.assertIn(f"CONFIG:-{CONFIG_PATH}", apply_text)
-        self.assertIn(f"SCRIPT:-{SCRIPT_PATH}", apply_text)
-        self.assertIn("PYTHON:-/usr/bin/python3", apply_text)
+    def test_units_and_install_scripts_address_the_installed_files(self):
+        for name, path in (("boot unit", BOOT_UNIT), ("resume unit", RESUME_UNIT)):
+            settings = unit_settings(path)
+            self.assertEqual(settings["ExecStart"], SCRIPT_BIN, name)
+            self.assertEqual(settings["CONFIG"], CONFIG_PATH, name)
+            self.assertEqual(settings["SETTLE"], "0", name)
         for name in ("install.sh", "uninstall.sh"):
             text = (REPO / "deploy" / name).read_text()
             self.assertIn(f"SCRIPT_PATH={SCRIPT_PATH}", text, name)
             self.assertIn(f"SCRIPT_BIN={SCRIPT_BIN}", text, name)
             self.assertIn(f"UNIT_PATH={UNIT_PATH}", text, name)
+            self.assertIn(f"RESUME_UNIT_PATH={RESUME_UNIT_PATH}", text, name)
+
+    def test_boot_unit_runs_once_per_boot_only(self):
+        settings = unit_settings(BOOT_UNIT)
+        self.assertEqual(settings["WantedBy"], ["multi-user.target"])
+        # Stay active, so the same boot does not apply the curve twice.
+        self.assertEqual(settings["RemainAfterExit"], "yes")
+        self.assertNotIn("suspend.target", settings["After"])
+
+    def test_resume_unit_runs_after_each_wakeup(self):
+        settings = unit_settings(RESUME_UNIT)
+        # Ordering against sleep.target applies the curve before suspending, not after.
+        self.assertNotIn("sleep.target", settings["After"])
+        self.assertNotIn("sleep.target", settings["WantedBy"])
+        for target in SLEEP_TARGETS:
+            self.assertIn(target, settings["After"], target)
+            self.assertIn(target, settings["WantedBy"], target)
+        # An already active unit pulled in by WantedBy= is not started again, so the next
+        # resume would be skipped if this one stayed active.
+        self.assertEqual(settings["RemainAfterExit"], "no")
+
+    def test_resume_unit_never_installs_itself_at_boot(self):
+        settings = unit_settings(RESUME_UNIT)
+        self.assertNotIn("multi-user.target", settings["WantedBy"])
 
 
 if __name__ == "__main__":

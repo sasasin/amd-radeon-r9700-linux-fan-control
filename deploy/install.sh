@@ -21,6 +21,8 @@ SCRIPT_PATH=/usr/local/lib/r9700-fan-control/fan_control.py
 SCRIPT_BIN=/usr/local/sbin/r9700-fan-curve.sh
 UNIT=r9700-fan-curve.service
 UNIT_PATH=/etc/systemd/system/r9700-fan-curve.service
+RESUME_UNIT=r9700-fan-curve-resume.service
+RESUME_UNIT_PATH=/etc/systemd/system/r9700-fan-curve-resume.service
 CONFIG_PATH=/etc/r9700/fan-curve.toml
 
 PYTHON=${PYTHON:-/usr/bin/python3}
@@ -31,7 +33,7 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-for path in "${repo_dir}/fan_control.py" "${deploy_dir}/${UNIT}" \
+for path in "${repo_dir}/fan_control.py" "${deploy_dir}/${UNIT}" "${deploy_dir}/${RESUME_UNIT}" \
             "${deploy_dir}/r9700-fan-curve.sh" "${config_src}"; do
     if [[ ! -r ${path} ]]; then
         echo "missing readable file: ${path}" >&2
@@ -51,6 +53,7 @@ install -d -m 0755 "/usr/local/lib/r9700-fan-control" "/etc/r9700"
 install -m 0644 "${repo_dir}/fan_control.py" "${SCRIPT_PATH}"
 install -m 0755 "${deploy_dir}/r9700-fan-curve.sh" "${SCRIPT_BIN}"
 install -m 0644 "${deploy_dir}/${UNIT}" "${UNIT_PATH}"
+install -m 0644 "${deploy_dir}/${RESUME_UNIT}" "${RESUME_UNIT_PATH}"
 
 if [[ -e ${CONFIG_PATH} && ${FORCE:-0} != 1 ]]; then
     echo "keeping existing ${CONFIG_PATH}"
@@ -60,11 +63,22 @@ else
 fi
 
 systemctl daemon-reload
-systemctl enable --now "${UNIT}"
+# enable + restart rather than enable --now: the boot unit keeps RemainAfterExit=yes, so
+# an already active unit would not be started again and a re-install would leave a cleared
+# curve (for example one dropped by a suspend) unapplied.
+systemctl enable "${UNIT}" "${RESUME_UNIT}"
+systemctl restart "${UNIT}"
+
+# The resume hook is only enabled, never started here. Enabling places its WantedBy links
+# under the sleep targets, which is the only moment it has to run.
 
 echo
 echo "== ${UNIT} =="
 systemctl status --no-pager --lines 5 "${UNIT}" || true
+echo
+echo "== ${RESUME_UNIT} =="
+systemctl is-enabled "${RESUME_UNIT}" || true
+systemctl list-dependencies --reverse suspend.target --no-pager 2> /dev/null | head -8 || true
 echo
 echo "== current state =="
 "${PYTHON}" "${SCRIPT_PATH}" status

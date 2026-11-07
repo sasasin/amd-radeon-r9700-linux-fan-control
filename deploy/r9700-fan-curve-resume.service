@@ -1,0 +1,37 @@
+# Installed to /etc/systemd/system/r9700-fan-curve-resume.service by deploy/install.sh.
+# Re-applies the fan curve after the machine resumes. The boot unit stays the only one
+# running on a normal boot: amdgpu resets the OverDrive fan table on resume, so the
+# curve is gone until this unit runs.
+#
+# Ordering uses the sleep targets themselves, never sleep.target. sleep.target is active
+# while the machine is going down into sleep, so After=sleep.target would apply the curve
+# immediately before suspending instead of after resuming. The targets below are reached
+# only after systemd-suspend.service (and friends) return from the actual sleep.
+[Unit]
+Description=Radeon AI PRO R9700 fan curve re-apply on resume
+Documentation=file:/etc/r9700/fan-curve.toml
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+Environment=CONFIG=/etc/r9700/fan-curve.toml
+Environment=SETTLE=0
+Environment=ATTEMPTS=60
+# Same script as the boot unit. The sysfs interface is already present on resume, so the
+# poll passes on the first attempt.
+ExecStart=/usr/local/sbin/r9700-fan-curve.sh
+# Must not stay active: a unit pulled in through WantedBy= is not started again while it
+# is already active, so the next resume would skip it.
+RemainAfterExit=no
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+# Hibernation and the hybrid paths cannot be exercised on this machine (kernel lockdown
+# under EFI Secure Boot blocks them), but they need this hook too: resuming from an image
+# restores userspace with the boot unit already active, so nothing else would re-apply
+# the curve.
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
