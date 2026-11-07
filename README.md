@@ -148,8 +148,8 @@ sudo -A systemctl restart r9700-fan-curve.service   # daemon-reloadは不要
 systemctl is-enabled r9700-fan-curve-resume.service        # enabled
 systemctl list-dependencies --reverse suspend.target      # resume ユニットがぶら下がる
 journalctl -u r9700-fan-curve-resume.service -b           # 復帰後の適用ログ
-# 実際に確認する場合（3分後に自動で起きる）
-sudo -A rtcwake -m memo -s 180
+sudo -A systemctl suspend                                  # 眠らせて復帰させる
+uv run fan_control.py status                               # 復帰後もカーブが残っていること
 ```
 
 このPCの実測では`r9700-power-fan.service`がboot 16.9秒で完了し、GDM起動が17.2秒、
@@ -158,11 +158,16 @@ sudo -A rtcwake -m memo -s 180
 ### 実機で確認した解除挙動
 
 * **再起動**: 解除される。起動時ユニットが再適用（boot 61.4秒で`+255ms`、GDM起動より前）
-* **サスペンド（S3）**: 解除される。復帰後の読み戻しが全点ゼロになり、実測PWMも
-  75.69% → 51.76%（junction 70°CでVBIOS既定の追従値）へ低下しました。amdgpuが復帰時に
-  `MODE1 reset`でOverDriveファンテーブルを再初期化するためです。hwmonの`power1_cap`
-  （275 W）はそのまま保持されました。`backend=fan_curve`は残るので`status`だけでは気づけません
-* **ハイバネーション**: このPCでは**実行不能**なので未実施。`/sys/kernel/security/lockdown`
+* **サスペンド（S3）**: 解除される。amdgpuが復帰時に`MODE1 reset`でOverDriveファンテーブルを
+  再初期化するためです。解除直後の読み戻しは全点ゼロ、`手動カーブ: 未設定（既定値）`となり
+  実測PWMも 75.69% → 51.76%（junction 70°CでVBIOS既定の追従値）へ低下しました。hwmonの
+  `power1_cap`（275 W）はそのまま保持され、`backend=fan_curve`も残るので
+  `status`だけでは気づけません。
+  **復帰時ユニットがこれを修復することを実測済みです**。`Waking up from system sleep state S3`
+  と同一秒でユニットが走り、`変更前`が「未設定（既定値）」のまま`カーブ設定: 25°C:20% …`を
+  書き戻して`status=0/SUCCESS`で完了しました（所要118ms、`RemainAfterExit=no`なので完了後
+  `inactive`に戻り次の復帰でも再実行されます）
+* **ハイバネーション**: このPCでは**実行不能**なので経路未確認。`/sys/kernel/security/lockdown`
   が`[integrity]`で、EFI Secure Boot由来のkernel lockdownがhibernationを禁止しています
   （`/sys/power/state`に`disk`が無く`/sys/power/disk`は`disabled`）。`WantedBy`へは
   念のため`hibernate.target`ほかにも張ってあります。ハイバネートからの復帰は
@@ -201,6 +206,16 @@ sudo -A rtcwake -m memo -s 180
   その`ExecStart`が復帰後に完結するので、`suspend.target`ほかの後段が復帰後になります。
   `/usr/lib/systemd/system-sleep/`のフックは公式が「hack」「Inhibitor Locksを使え」と
   明記しているため使いません。
+* **睡眠に失敗したときも復帰時ユニットが走る**: 順序が「睡眠トランザクションの完結後」に
+  一致するため、`pci_pm_prepare`がエラーで睡眠そのものが失敗した場合にもユニットは発火します。
+  `fan_control.py`は冪等で、現在の値を読み戻して同じカーブを書き直すだけなので害はありません。
+  部分睡眠でテーブルだけが消えた場合にも直るので、安全側の挙動です。
+* **サスペンド自体が失敗することがある**: amdgpuの`pci_pm_prepare`が`-12`（ENOMEM）を返して
+  `PM: Some devices failed to suspend`になる事例を実測しました（メモリ使用率が9割近く、
+  `systemd-sleep`が`page allocation failure`を出した状態）。`deep`失敗後に`s2idle`でも
+  同じ理由で失敗します。メモリを空ければ同じ操作で成功し、`/sys/power/suspend_stats/success`
+  が加算されます。このCLIとユニットの動作とは無関係ですが、復帰検証をするときは負荷を下げて
+  ください。
 
 ### 取り除く
 
@@ -453,9 +468,10 @@ SMI初期化が失敗した場合の自動制御復帰も確認しています�
 温度カーブのTOML/CLI設定、実測PWM/RPM、コマンド終了後の保持確認は
 [validation/2026-10-23-curve.md](validation/2026-10-23-curve.md)に記録しています。
 
-`deploy/`の一式は実機に組み込み済みです。起動時ユニットは再起動を跨いで適用されることが
-実測済みで、サスペンド復帰でカーブが解除されることも実測しています（上の節）。
-**復帰時ユニットの動作は、インストール後のサスペンド実測がまだです。**
+`deploy/`の一式は実機に組み込み済みです。起動時ユニットは再起動を跨いで適用されること、
+サスペンド復帰でカーブが解除されること、復帰時ユニットがその解除を修復することを
+いずれも実測しています（上の節）。**ハイバネーション復帰の経路のみ未実測です**
+（このPCではkernel lockdownで実行不能なため）。
 
 ## 他のAMD Radeon製品での利用
 
