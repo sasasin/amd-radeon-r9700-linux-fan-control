@@ -1,0 +1,15 @@
+# Boot-time curve applied by r9700-fan-curve.service. Copy of this file installed to
+# /etc/r9700/fan-curve.toml; edit that installed copy, not this one, and then run
+# sudo -A systemctl restart r9700-fan-curve.service.
+#
+# Hotspot / junction temperature (°C) and PWM (%), ascending, no duplicate temperature.
+# This R9700 exposes exactly five points and accepts 25..100°C and 20..100% PWM.
+# Values are the ones measured on this machine; other cards need their own limits read
+# from `fan_control.py status --json`.
+points = [
+    [25, 20],
+    [40, 35],
+    [65, 60],
+    [75, 80],
+    [85, 100],
+]

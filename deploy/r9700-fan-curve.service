@@ -1,0 +1,30 @@
+# Installed to /etc/systemd/system/r9700-fan-curve.service by deploy/install.sh.
+# Customizing the curve normally means editing /etc/r9700/fan-curve.toml, not this file.
+# For per-machine overrides use a drop-in: sudo -A systemctl edit r9700-fan-curve.service
+[Unit]
+Description=Radeon AI PRO R9700 boot fan curve
+Documentation=file:/etc/r9700/fan-curve.toml
+# local-fs.target only. The GPU sysfs interface is polled by the script because amdgpu
+# finishes driver initialization after this point in the boot transaction.
+After=local-fs.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+Environment=CONFIG=/etc/r9700/fan-curve.toml
+# Zero keeps the boot transaction from waiting on the post-change measurement.
+Environment=SETTLE=0
+Environment=ATTEMPTS=60
+# On a multi-GPU machine, pin the fan target, e.g. GPU=0000:0b:00.0
+# Environment=GPU=
+ExecStart=/usr/local/sbin/r9700-fan-curve.sh
+# oneshot only allows Restart=on-failure; always and on-success are rejected.
+Restart=on-failure
+RestartSec=5
+# Bounds the ATTEMPTS polling plus the CLI run so a failed GPU never stalls boot forever.
+TimeoutStartSec=180
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,8 @@ PWM 20%・約1,066 RPMからPWM 40%・約2,052 RPMへ変わり、
 このPCでは`/etc/modprobe.d/90-amdgpu-fan-control.conf`の配置と、
 kernel 7.0.0-38-genericのinitramfs更新、再起動まで完了しています。
 動作中のマスクは`0xfff7ffff`で、`gpu_od/fan_ctrl/fan_curve`が公開されています。
+再起動後にカーブを再適用するsystemdユニットも`deploy/`に同梱しています。
+カーブはサスペンド復帰でも解除されるため、復帰時に再適用するユニットも入れてあります。
 
 ## 使い方
 
@@ -72,6 +74,10 @@ points = [
 ]
 ```
 
+同梱のTOMLは2種類です。`config/fan-curve.example.toml`は`--config`の引数例、
+`config/fan-curve.toml`は起動時ユニットが`/etc/r9700/fan-curve.toml`へインストールする
+既定値で、このPCの実測値です。いずれも形式は同じで`points`キーだけを持ちます。
+
 温度は重複なしの昇順、PWMは同じ値または増加する整数で指定します。
 入力を勝手に並べ替えたり、点数を補間して増減したり、許容範囲へ丸めたりはしません。
 点間の温度追従はGPUファームウェアの直線カーブ制御に任せます。
@@ -82,7 +88,8 @@ points = [
 設定途中の失敗や測定中の中断時には標準自動制御への復帰を試みます。
 `--seconds`なしの正常終了ではカーブが残り、プロセス終了後もGPU側が制御を続けます。
 `--seconds`ありでは観測後に既定値へ戻します。以前の独自カーブへの復元ではありません。
-再起動後にカーブを再適用する仕組みは含みません。
+再起動後にカーブを再適用する仕組みは次節「起動時にカーブを再適用する」の`deploy/`一式です。
+カーブは再起動だけでなくサスペンド復帰でも解除されます。
 カーブ設定は`fan_curve`対応GPU専用で、従来の`pwm1`のみのGPUには対応しません。
 
 変更時だけ内部で`sudo -A /usr/bin/python3 ...`を実行します。uv自体をrootで動かす必要はありません。
@@ -94,7 +101,130 @@ NoNewPrivsでsudoが禁止されているサンドボックスでは、通常の
 `test`の正常終了、Ctrl+C、SIGTERMでは自動制御へ戻します。
 `set`の正常終了後は手動設定が残るので、終了したいときは`auto`を実行します。
 設定途中の失敗時も自動制御への復帰を試み、復帰失敗はエラーとして表示します。
-SIGKILL・電源断での後処理はできません。常駐デーモンや再起動後の設定再適用は含みません。
+SIGKILL・電源断での後処理はできません。常駐デーモンは同梱しません。
+再起動とスリープ復帰後の再適用を図る起動時・復帰時ユニットを次節で提供します。
+
+## 起動時にカーブを再適用する
+
+カーブ設定は**再起動だけでなくサスペンド復帰でも解除される**ことが実機で確認できました。
+`deploy/`の一式を組み込むと、起動時ユニットがログイン前の起動直後に、復帰時ユニットが
+スリープからの復帰直後に、いずれも`/etc/r9700/fan-curve.toml`を再適用します。
+常駐せず、両方とも`Type=oneshot`で必要な時だけ1回実行します。
+`uv`は使わず、標準ライブラリのみで動く`/usr/bin/python3`でroot所有のコピーを実行します。
+
+```bash
+sudo -A deploy/install.sh
+```
+
+### 配置先と編集する場所
+
+| パス | 内容 | 編集 |
+| --- | --- | --- |
+| `/etc/r9700/fan-curve.toml` | カーブ設定点。**随意に変更してよい唯一のファイル** | `sudoedit`で編集し`systemctl restart` |
+| `/usr/local/lib/r9700-fan-control/fan_control.py` | このリポジトリの`fan_control.py`のroot所有コピー | 編集しない。更新時は再install |
+| `/usr/local/sbin/r9700-fan-curve.sh` | 制御インターフェースの出現を待ち、上記を`--settle 0`で呼ぶ。両ユニットで共通 | 編集しない |
+| `/etc/systemd/system/r9700-fan-curve.service` | 起動時。`WantedBy=multi-user.target` | 編集しない。上書きは`systemctl edit`のドロップイン |
+| `/etc/systemd/system/r9700-fan-curve-resume.service` | スリープ復帰時。`WantedBy=suspend.target`ほか | 同上 |
+
+`/usr/local`と`/etc`配下がすべてroot所有なのは、起動時ユニットがrootで実行されるためです。
+`ExecStart=python3 /home/<user>/.../fan_control.py`のように、**書き換え可能なユーザー所有の
+スクリプトをrootで実行させる形は一般的な権限昇格経路**なので使いません。リポジトリの作業
+コピーを書き換えても削除しても、起動時の適用には影響しません。リポジトリを更新したときは
+`sudo -A deploy/install.sh`でコピーを塗り直します。
+
+### 確認と変更
+
+```bash
+systemctl status r9700-fan-curve.service        # 終了状態と直近ログ
+journalctl -u r9700-fan-curve.service           # 適用内容の全文
+uv run fan_control.py status                    # 現在のカーブ
+sudoedit /etc/r9700/fan-curve.toml              # 設定変更
+sudo -A systemctl restart r9700-fan-curve.service   # daemon-reloadは不要
+```
+
+復帰時ユニットの有効状態と、スリープ後に走ることは次のように確認します。
+
+```bash
+systemctl is-enabled r9700-fan-curve-resume.service        # enabled
+systemctl list-dependencies --reverse suspend.target      # resume ユニットがぶら下がる
+journalctl -u r9700-fan-curve-resume.service -b           # 復帰後の適用ログ
+sudo -A systemctl suspend                                  # 眠らせて復帰させる
+uv run fan_control.py status                               # 復帰後もカーブが残っていること
+```
+
+このPCの実測では`r9700-power-fan.service`がboot 16.9秒で完了し、GDM起動が17.2秒、
+`graphical.target`到達が22.6秒です。ログイン操作を待たずに適用が終わります。
+
+### 実機で確認した解除挙動
+
+* **再起動**: 解除される。起動時ユニットが再適用（boot 61.4秒で`+255ms`、GDM起動より前）
+* **サスペンド（S3）**: 解除される。amdgpuが復帰時に`MODE1 reset`でOverDriveファンテーブルを
+  再初期化するためです。解除直後の読み戻しは全点ゼロ、`手動カーブ: 未設定（既定値）`となり
+  実測PWMも 75.69% → 51.76%（junction 70°CでVBIOS既定の追従値）へ低下しました。hwmonの
+  `power1_cap`（275 W）はそのまま保持され、`backend=fan_curve`も残るので
+  `status`だけでは気づけません。
+  **復帰時ユニットがこれを修復することを実測済みです**。`Waking up from system sleep state S3`
+  と同一秒でユニットが走り、`変更前`が「未設定（既定値）」のまま`カーブ設定: 25°C:20% …`を
+  書き戻して`status=0/SUCCESS`で完了しました（所要118ms、`RemainAfterExit=no`なので完了後
+  `inactive`に戻り次の復帰でも再実行されます）
+* **ハイバネーション**: このPCでは**実行不能**なので経路未確認。`/sys/kernel/security/lockdown`
+  が`[integrity]`で、EFI Secure Boot由来のkernel lockdownがhibernationを禁止しています
+  （`/sys/power/state`に`disk`が無く`/sys/power/disk`は`disabled`）。`WantedBy`へは
+  念のため`hibernate.target`ほかにも張ってあります。ハイバネートからの復帰は
+  userspaceの状態をそのまま復元するため起動時ユニットが再実行されず、この口がなければ
+  カーブが消えたままになるからです。lockdownを解除する運用（Secure Boot無効化＋
+  RAM以上の単一スワップ領域＋`resume=`設定とinitramfs更新）に変えた際の実測は未実施です
+
+### 設計上の判断
+
+* **待機**: amdgpuが初期化を済ませる前に`gpu_od/fan_ctrl/fan_curve`は現れません。既定で
+  最大60秒、1秒間隔で存在を確認します。udevの`RUN+=`は「極めて短い同期タスクのみ」が規定で、
+  実行中は同一デバイスの以降のイベントを止め、起動したプロセスはイベント終了後にkillされます。
+  udevからsystemdを動かす場合も公式は`SYSTEMD_WANTS`によるサービス起動を推奨しています。
+  systemdの`.device`ユニットに待機を委ねる手は、drm cardに`systemd`タグが無くunit名がsysfs
+  パスのエスケープで長大になるため採用していません。
+* **ブートを止めない**: `--settle 0`で変更後の測定を省略し、`TimeoutStartSec=180`で上限を
+  切ります。`multi-user.target`に紐付くため、ユニットは完了まで起動トランザクションを
+  待たせます。このPCでは数秒以内に完了しています。
+* **失敗時**: `Restart=on-failure`と`StartLimitBurst`で無限リトライを防ぎます。
+  `Type=oneshot`で許可されるのは`on-failure`だけで、`always`と`on-success`は拒否されます。
+  設定値の不正は`fan_control.py`が書き込み前に拒否し、途中失敗時は自動制御への復帰を試みます。
+* **ログイン後の仕組みを使わない理由**: `~/.profile`、GNOME自動起動、cron `@reboot`、
+  systemd userユニットはいずれもログインかcron daemonの起動を待ち、root書き込みが必要なため
+  `sudoers`のNOPASSWDや自動ログインが追加で必要になります。起動時ユニットなら昇格設定そのものが
+  不要です。書き込み対象がroot限定のsysfs属性なので、udevやACLで非root化もできません。
+* **複数GPU**: ファンを持つGPUが複数あると`fan_control.py`が対象を尋ねて終了します。
+  `sudo -A systemctl edit r9700-fan-curve.service`で`Environment=GPU=0000:0b:00.0`を設定します。
+  復帰時ユニットにも同じdrop-inを当ててください。
+* **復帰時に別ユニットにする理由**: 起動時ユニットは`RemainAfterExit=yes`で`active`を
+  維持します。systemdは`WantedBy=`で引っかけられた**すでにactiveのユニットを再startしない**
+  ため、同じユニットに`suspend.target`を足しても復帰後に走りません。復帰時ユニットは
+  `RemainAfterExit=no`にして毎回startされるようにします。
+* **順序指定は`After=suspend.target`**とし`sleep.target`には張しません。`sleep.target`は
+  眠る**前**にactiveになるため、`After=sleep.target`だと復帰後ではなくスリープ直前に
+  走ります。実際の睡眠は`After=sleep.target`順で起動する`systemd-suspend.service`が担い、
+  その`ExecStart`が復帰後に完結するので、`suspend.target`ほかの後段が復帰後になります。
+  `/usr/lib/systemd/system-sleep/`のフックは公式が「hack」「Inhibitor Locksを使え」と
+  明記しているため使いません。
+* **睡眠に失敗したときも復帰時ユニットが走る**: 順序が「睡眠トランザクションの完結後」に
+  一致するため、`pci_pm_prepare`がエラーで睡眠そのものが失敗した場合にもユニットは発火します。
+  `fan_control.py`は冪等で、現在の値を読み戻して同じカーブを書き直すだけなので害はありません。
+  部分睡眠でテーブルだけが消えた場合にも直るので、安全側の挙動です。
+* **サスペンド自体が失敗することがある**: amdgpuの`pci_pm_prepare`が`-12`（ENOMEM）を返して
+  `PM: Some devices failed to suspend`になる事例を実測しました（メモリ使用率が9割近く、
+  `systemd-sleep`が`page allocation failure`を出した状態）。`deep`失敗後に`s2idle`でも
+  同じ理由で失敗します。メモリを空ければ同じ操作で成功し、`/sys/power/suspend_stats/success`
+  が加算されます。このCLIとユニットの動作とは無関係ですが、復帰検証をするときは負荷を下げて
+  ください。
+
+### 取り除く
+
+```bash
+sudo -A deploy/uninstall.sh
+```
+
+ユニット2本とroot所有のコピーを削除し、自動制御への復帰を試みます。
+`/etc/r9700/fan-curve.toml`と`/etc/modprobe.d/90-amdgpu-fan-control.conf`は残ります。
 
 ## 「%」の意味
 
@@ -326,13 +456,22 @@ uv run --offline python -m unittest discover -s tests -v
 ```
 
 入力範囲、書き込み非対応、複数GPUの曖昧さ、設定の読み戻し、途中失敗時の復帰などを検証します。
-28件が成功しています。カーブ入力の点数・範囲・並び順・TOML、書き込み前の拒否、
+37件が成功しています。カーブ入力の点数・範囲・並び順・TOML、書き込み前の拒否、
 dry-run時の非昇格、一時設定の自動復帰、初期カーブが全点ゼロの場合、空欄のZero RPM項目、
 SMI初期化が失敗した場合の自動制御復帰も確認しています。
+`tests/test_deploy.py`はハードウェアに依存せず、起動スクリプトの引数組み立てと
+インターフェース未出現時の取り直し、unit・install・uninstallが参照するパスの一致、
+起動時ユニットが`multi-user.target`のみで1回だけ走ることを確認します。
+復帰時ユニットには`sleep.target`順序指定の誤り検出と`RemainAfterExit=no`の検査も入れています。
 ファイルを使うテストと実機のファン変更は別で、テスト合格だけでは実機での制御成功を意味しません。
 再起動前後の実測は[validation/2026-10-23.md](validation/2026-10-23.md)に記録しています。
 温度カーブのTOML/CLI設定、実測PWM/RPM、コマンド終了後の保持確認は
 [validation/2026-10-23-curve.md](validation/2026-10-23-curve.md)に記録しています。
+
+`deploy/`の一式は実機に組み込み済みです。起動時ユニットは再起動を跨いで適用されること、
+サスペンド復帰でカーブが解除されること、復帰時ユニットがその解除を修復することを
+いずれも実測しています（上の節）。**ハイバネーション復帰の経路のみ未実測です**
+（このPCではkernel lockdownで実行不能なため）。
 
 ## 他のAMD Radeon製品での利用
 
@@ -369,6 +508,9 @@ GPUが実際に設定を受け付け、意図したファン動作になる保�
 ## 参照
 
 * [AMD SMI Python API / ファン速度取得・設定](https://rocm.docs.amd.com/projects/amdsmi/en/latest/reference/amdsmi-py-api.html)
+* [systemd.service(5) — Type=oneshotとRestart=の制約](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+* [udev(7) — RUN+=の制約とSYSTEMD_WANTSによるサービス起動](https://www.freedesktop.org/software/systemd/man/latest/udev.html)
+* [systemd.device(5) — `TAG+="systemd"`とデバイスユニット](https://www.freedesktop.org/software/systemd/man/latest/systemd.device.html)
 * [Linux amdgpu: HWMON・fan_curve・fan_minimum_pwm](https://docs.kernel.org/gpu/amdgpu/thermal.html)
 * [AMD SMI公式実装](https://github.com/ROCm/amdsmi)
 * [amdgpu SMU 14.0.2の実装](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c)
